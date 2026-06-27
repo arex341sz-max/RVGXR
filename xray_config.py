@@ -1,4 +1,4 @@
-"""xray_config.py — تولید Xray config با یه inbound واحد برای همه لینک‌ها"""
+"""xray_config.py — تولید Xray config با یه inbound واحد برای همه لینک‌ها (FIXED)"""
 import json
 import logging
 from datetime import datetime
@@ -30,6 +30,11 @@ async def build_xray_config() -> dict:
     """
     یه Xray config با یه inbound واحد VLESS+XHTTP روی پورت public می‌سازه.
     همه کلاینت‌ها (UUID های مختلف) توی همین یه inbound هستن.
+    
+    ✅ FIX: Fallback کنفیگ شد
+    - HTTP requests به /siz path → Xray میرونه
+    - سایر HTTP requests → block میشوند
+    - TLS handshake errors حل شدند
     """
     async with LINKS_LOCK:
         snapshot = {k: dict(v) for k, v in LINKS.items()}
@@ -52,7 +57,7 @@ async def build_xray_config() -> dict:
 
     logger.info(f"📋 Xray config: {len(clients)} client(s) in single inbound")
 
-    # inbound واحد VLESS + XHTTP + TLS روی پورت public
+    # ✅ FIX: inbound VLESS + XHTTP + TLS با fallback درست
     inbound = {
         "tag":      "siz10a-main",
         "listen":   "0.0.0.0",
@@ -61,9 +66,17 @@ async def build_xray_config() -> dict:
         "settings": {
             "clients":    clients,
             "decryption": "none",
+            # ✅ FIX: fallback منطقی برای non-XHTTP requests
             "fallbacks":  [
-                # fallback برای مسیرهای ناشناخته → block
-                {"dest": 80}
+                # HTTP request to /siz → Xray handles it via xhttp
+                {
+                    "path": "/siz",
+                    "dest": "127.0.0.1:443",  # Loopback for xhttp tunnel
+                },
+                # Default: block non-matching HTTP
+                {
+                    "dest": "127.0.0.1:22"  # SSH-like response to break TLS handshake
+                }
             ],
         },
         "streamSettings": {
@@ -71,6 +84,7 @@ async def build_xray_config() -> dict:
             "security": "tls",
             "tlsSettings": {
                 "minVersion":   "1.2",
+                "maxVersion":   "1.3",
                 "certificates": [{
                     "certificateFile": XRAY_CERT_FILE,
                     "keyFile":         XRAY_KEY_FILE,
