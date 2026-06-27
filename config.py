@@ -2,9 +2,9 @@
 import os
 import secrets
 
-# پورت عمومی Railway — همه ترافیک از اینجا میاد
+# Railway فقط یک پورت expose می‌کنه
 PORT          = int(os.environ.get("PORT", 8080))
-PUBLIC_PORT   = PORT  # پورت عمومی (Python proxy روی این گوش میده)
+PUBLIC_PORT   = PORT
 
 SECRET_KEY    = os.environ.get("SECRET_KEY", secrets.token_urlsafe(32))
 ADMIN_PW      = os.environ.get("ADMIN_PASSWORD", "123456")
@@ -19,8 +19,9 @@ XRAY_CERT_DIR  = os.environ.get("XRAY_CERT_DIR", "/data/certs")
 XRAY_CERT_FILE = os.path.join(XRAY_CERT_DIR, "cert.pem")
 XRAY_KEY_FILE  = os.path.join(XRAY_CERT_DIR, "key.pem")
 
-# پورت‌های داخلی — Railway فقط PORT رو expose میکنه
-XRAY_INTERNAL_PORT = int(os.environ.get("XRAY_INTERNAL_PORT", 9443))  # Xray روی این گوش میده
-ADMIN_PORT         = int(os.environ.get("ADMIN_PORT", 8081))           # aiohttp API
+# پورت داخلی Xray — هیچوقت expose نمیشه
+XRAY_INTERNAL_PORT = int(os.environ.get("XRAY_INTERNAL_PORT", 10443))
+# Admin API روی یک پورت داخلی دیگه
+ADMIN_PORT         = int(os.environ.get("ADMIN_PORT", 10081))
 
 SESSION_TTL = 60 * 60 * 24 * 7
