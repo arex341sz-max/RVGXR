@@ -4,7 +4,12 @@ main.py — RVG Gateway v11 | Xray-native (بدون FastAPI)
 معماری:
   - Xray مستقیماً روی پورت PUBLIC (8080) → همه ترافیک VPN
   - aiohttp سبک روی ADMIN_PORT (8081) → dashboard + API
+  - HTTP fallback listener روی port 8082 → health check های Railway
   - هیچ relay/proxy لازم نیست — Xray native handle می‌کنه
+
+FIX: اضافه شدن HTTP health-check server روی port 8082
+     تا Railway health check (plain HTTP) جواب درست بگیره
+     به جای TLS handshake error.
 """
 import asyncio
 import base64
@@ -38,6 +43,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("RVG")
+
+# ── FIX: پورت HTTP fallback برای health check Railway ────────────────────────
+# Xray plain HTTP requests رو به این پورت forward میکنه (از fallback config)
+HEALTH_FALLBACK_PORT = int(os.environ.get("HEALTH_FALLBACK_PORT", 8082))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -815,6 +824,49 @@ def build_app() -> web.Application:
     return app
 
 
+# ── FIX: HTTP Health-check server (fallback از Xray) ─────────────────────────
+# Railway health check با plain HTTP به port 8080 وصل میشه
+# Xray این درخواست‌ها رو به port 8082 forward میکنه (از طریق fallback config)
+# این server روی 8082 گوش میده و /health رو جواب میده
+
+async def _http_health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """
+    یه HTTP handler ساده برای health check های Railway.
+    Xray plain HTTP requests رو از port 8080 به اینجا forward میکنه.
+    """
+    try:
+        # خوندن request header
+        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+        request_line = data.decode("utf-8", errors="replace").split("\r\n")[0]
+
+        s = int(time.time() - stats["start_time"])
+        uptime = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+        body = json.dumps({
+            "status":      "ok",
+            "connections": len(connections),
+            "uptime":      uptime,
+            "xray":        get_status()["running"],
+        })
+        response = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+            f"{body}"
+        )
+        writer.write(response.encode())
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
 async def main():
     init_auth()
     await load_state()
@@ -822,11 +874,21 @@ async def main():
     _ensure_self_signed_cert()
     await start_monitor()
 
+    # Admin API (aiohttp) روی پورت 8081
     app = build_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", ADMIN_PORT)
     await site.start()
+
+    # FIX: HTTP health-check server روی پورت 8082
+    # این server plain HTTP requests از Xray fallback رو handle میکنه
+    health_server = await asyncio.start_server(
+        _http_health_handler,
+        "127.0.0.1",   # فقط localhost — Xray از همین host forward میکنه
+        HEALTH_FALLBACK_PORT,
+    )
+    logger.info(f"🏥 HTTP health-check server listening on 127.0.0.1:{HEALTH_FALLBACK_PORT}")
 
     logger.info(f"🚀 RVG Gateway v11 — Xray-native architecture")
     logger.info(f"📡 Xray (VPN) listening on port {PUBLIC_PORT}")
@@ -836,6 +898,8 @@ async def main():
     try:
         await asyncio.Event().wait()
     finally:
+        health_server.close()
+        await health_server.wait_closed()
         await stop_monitor()
         await save_state()
         await runner.cleanup()
