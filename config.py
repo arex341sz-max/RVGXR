@@ -1,8 +1,7 @@
-"""config.py — تمام تنظیمات از environment variables"""
+"""config.py"""
 import os
 import secrets
 
-# Railway فقط یک پورت expose می‌کنه
 PORT          = int(os.environ.get("PORT", 8080))
 PUBLIC_PORT   = PORT
 
@@ -19,9 +18,8 @@ XRAY_CERT_DIR  = os.environ.get("XRAY_CERT_DIR", "/data/certs")
 XRAY_CERT_FILE = os.path.join(XRAY_CERT_DIR, "cert.pem")
 XRAY_KEY_FILE  = os.path.join(XRAY_CERT_DIR, "key.pem")
 
-# پورت داخلی Xray — هیچوقت expose نمیشه
+# Xray روی این پورت داخلی گوش میده — هیچوقت expose نمیشه
 XRAY_INTERNAL_PORT = int(os.environ.get("XRAY_INTERNAL_PORT", 10443))
-# Admin API روی یک پورت داخلی دیگه
-ADMIN_PORT         = int(os.environ.get("ADMIN_PORT", 10081))
+ADMIN_PORT         = PORT  # admin همون PORT عمومیه
 
 SESSION_TTL = 60 * 60 * 24 * 7
