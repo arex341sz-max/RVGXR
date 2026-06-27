@@ -30,7 +30,6 @@ RUN mkdir -p /data/certs \
        -days   3650 \
        -subj   "/CN=rvg-gateway" 2>/dev/null
 
-# Railway فقط PORT رو expose می‌کنه
 EXPOSE 8080
 
 CMD ["python", "main.py"]
