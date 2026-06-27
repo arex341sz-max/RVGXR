@@ -1,4 +1,4 @@
-"""xray_config.py — تولید Xray config — Xray روی پورت داخلی 9443"""
+"""xray_config.py — Xray روی پورت داخلی 10443 با HTTP (بدون TLS)"""
 import json
 import logging
 from datetime import datetime
@@ -27,10 +27,6 @@ def _is_allowed(link: dict) -> bool:
 
 
 async def build_xray_config() -> dict:
-    """
-    Xray روی پورت داخلی XRAY_INTERNAL_PORT (9443) گوش میده.
-    Python proxy روی PORT (8080) همه ترافیک VPN رو به اینجا forward میکنه.
-    """
     async with LINKS_LOCK:
         snapshot = {k: dict(v) for k, v in LINKS.items()}
 
@@ -39,16 +35,16 @@ async def build_xray_config() -> dict:
         if not _is_allowed(link):
             continue
         clients.append({"id": link.get("secret", uuid), "flow": ""})
-        logger.debug(f"  client: {uuid[:8]} label={link.get('label','')}")
 
     if not clients:
         clients = [{"id": "00000000-0000-0000-0000-000000000000", "flow": ""}]
 
     logger.info(f"📋 Xray config: {len(clients)} client(s) — internal port {XRAY_INTERNAL_PORT}")
 
+    # Xray روی localhost بدون TLS — Python middleware TLS رو handle میکنه
     inbound = {
-        "tag":      "siz10a-main",
-        "listen":   "127.0.0.1",        # فقط localhost — Python proxy از اینجا forward میکنه
+        "tag":      "siz10a-in",
+        "listen":   "127.0.0.1",
         "port":     XRAY_INTERNAL_PORT,
         "protocol": "vless",
         "settings": {
@@ -57,16 +53,7 @@ async def build_xray_config() -> dict:
         },
         "streamSettings": {
             "network":  "xhttp",
-            "security": "tls",
-            "tlsSettings": {
-                "minVersion":   "1.2",
-                "certificates": [{
-                    "certificateFile": XRAY_CERT_FILE,
-                    "keyFile":         XRAY_KEY_FILE,
-                }],
-                "alpn": ["h3", "h2", "http/1.1"],
-                "enableSessionResumption": True,
-            },
+            "security": "none",   # بدون TLS — Python proxy از بیرون TLS داره
             "xhttpSettings": {
                 "path":                  "/siz",
                 "host":                  "",
@@ -115,4 +102,4 @@ async def write_xray_config() -> str:
 
 
 def get_port_map() -> dict:
-    return {}
+    return {"xray_internal": XRAY_INTERNAL_PORT}
