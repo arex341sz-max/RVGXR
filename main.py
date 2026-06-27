@@ -1,13 +1,13 @@
 """
-main.py — RVG Gateway v11 | Xray-native
+main.py — RVG Gateway v12 | Railway Single-Port
 
-معماری نهایی:
-  PORT=8080  → Python smart proxy (عمومی — Railway)
-                 ├── GET /health, /         → جواب مستقیم (200 OK)
-                 ├── /login, /dashboard, /api/*, /sub/*, /p/* → aiohttp (8081)
-                 └── بقیه (VPN traffic /siz) → Xray TLS (9443)
-  PORT=8081  → aiohttp Admin API + Dashboard (داخلی)
-  PORT=9443  → Xray VLESS+XHTTP+TLS (داخلی، فقط localhost)
+معماری:
+  PORT=8080  → Smart Proxy (عمومی — Railway expose می‌کنه)
+                 ├── plain HTTP → Admin API (127.0.0.1:10081)
+                 └── TLS/binary → Xray (127.0.0.1:10443)
+
+  127.0.0.1:10081 → aiohttp Admin API + Dashboard (داخلی)
+  127.0.0.1:10443 → Xray VLESS+XHTTP+TLS (داخلی)
 """
 import asyncio
 import base64
@@ -665,9 +665,9 @@ async def public_sub_data(request: web.Request):
 async def root(request: web.Request):
     return json_resp({
         "service":   "RVG Gateway",
-        "version":   "11.0",
+        "version":   "12.0",
         "status":    "active",
-        "arch":      "Xray-native (smart proxy)",
+        "arch":      "Xray-native (single-port Railway)",
         "xray_port": XRAY_INTERNAL_PORT,
         "protocols": list(PROTOCOLS_INFO),
         "channel":   "https://t.me/CodeBoxo",
@@ -694,7 +694,7 @@ async def public_page(request: web.Request):
     return web.Response(text=get_html(uuid_key), content_type="text/html")
 
 
-# ── App builder (Admin API روی 8081) ─────────────────────────────────────────
+# ── App builder ───────────────────────────────────────────────────────────────
 
 def build_admin_app() -> web.Application:
     app = web.Application()
@@ -793,34 +793,14 @@ def _ensure_self_signed_cert() -> bool:
         return False
 
 
-# ── Smart Proxy روی PORT=8080 ─────────────────────────────────────────────────
+# ── Smart Proxy ───────────────────────────────────────────────────────────────
 #
-# این proxy روی پورت عمومی Railway گوش میده و ترافیک رو تشخیص میده:
-#   - plain HTTP (GET /health, /login, /api/*, ...) → forward به aiohttp (8081)
-#   - TLS / binary (VPN clients) → forward به Xray (9443)
-#
-# Railway health check با plain HTTP میاد → به 8081 هدایت میشه → 200 OK ✅
-# کلاینت‌های VPN با TLS میان → به 9443 (Xray) هدایت میشن ✅
+# روی PORT عمومی Railway گوش میده:
+#   - plain HTTP → Admin API (127.0.0.1:ADMIN_PORT)
+#   - TLS/binary → Xray   (127.0.0.1:XRAY_INTERNAL_PORT)
 
 ADMIN_PROXY_HOST = "127.0.0.1"
 XRAY_PROXY_HOST  = "127.0.0.1"
-
-# مسیرهایی که باید به Admin API بره (plain HTTP)
-_ADMIN_PREFIXES = (
-    b"GET /health",
-    b"GET /",
-    b"GET /login",
-    b"GET /dashboard",
-    b"GET /stats",
-    b"GET /sub",
-    b"GET /api/",
-    b"GET /p/",
-    b"POST /api/",
-    b"PATCH /api/",
-    b"DELETE /api/",
-    b"HEAD /",
-    b"OPTIONS /",
-)
 
 
 def _is_plain_http(data: bytes) -> bool:
@@ -857,11 +837,10 @@ async def _smart_proxy_handler(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
 ):
-    peer = client_writer.get_extra_info("peername", ("?", 0))
     try:
         # خوندن اول داده برای تشخیص نوع ترافیک
         try:
-            first_bytes = await asyncio.wait_for(client_reader.read(4096), timeout=10.0)
+            first_bytes = await asyncio.wait_for(client_reader.read(4096), timeout=15.0)
         except asyncio.TimeoutError:
             client_writer.close()
             return
@@ -871,22 +850,31 @@ async def _smart_proxy_handler(
             return
 
         if _is_plain_http(first_bytes):
-            # → Admin API (aiohttp روی 8081)
+            # → Admin API
             target_host = ADMIN_PROXY_HOST
             target_port = ADMIN_PORT
         else:
-            # → Xray TLS (روی 9443)
+            # → Xray TLS
             target_host = XRAY_PROXY_HOST
             target_port = XRAY_INTERNAL_PORT
 
-        try:
-            up_reader, up_writer = await asyncio.open_connection(target_host, target_port)
-        except Exception as e:
-            logger.warning(f"Proxy connect failed → {target_host}:{target_port}: {e}")
-            client_writer.close()
-            return
+        # اتصال به target — retry اگه هنوز آماده نیست
+        up_reader = up_writer = None
+        for attempt in range(5):
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection(target_host, target_port),
+                    timeout=5.0,
+                )
+                break
+            except Exception:
+                if attempt < 4:
+                    await asyncio.sleep(0.5)
+                else:
+                    client_writer.close()
+                    return
 
-        # ارسال داده‌های اولیه که خوندیم
+        # ارسال داده‌های اولیه
         up_writer.write(first_bytes)
         await up_writer.drain()
 
@@ -898,7 +886,7 @@ async def _smart_proxy_handler(
         )
 
     except Exception as e:
-        logger.debug(f"Proxy handler error from {peer}: {e}")
+        logger.debug(f"Proxy handler error: {e}")
     finally:
         try:
             client_writer.close()
@@ -913,29 +901,29 @@ async def main():
     await load_state()
     await _ensure_default_link()
     _ensure_self_signed_cert()
-    await start_monitor()
 
-    # 1. Admin API روی 8081 (داخلی)
+    # 1. Admin API روی ADMIN_PORT (داخلی — فقط localhost)
     app = build_admin_app()
     runner = web.AppRunner(app)
     await runner.setup()
     admin_site = web.TCPSite(runner, "127.0.0.1", ADMIN_PORT)
     await admin_site.start()
-    logger.info(f"🖥  Admin API listening on 127.0.0.1:{ADMIN_PORT}")
+    logger.info(f"🖥  Admin API → 127.0.0.1:{ADMIN_PORT}")
 
-    # 2. Smart Proxy روی PUBLIC_PORT (8080) — عمومی
+    # 2. Xray start (داخلی)
+    await start_monitor()
+    logger.info(f"📡 Xray → 127.0.0.1:{XRAY_INTERNAL_PORT}")
+
+    # 3. Smart Proxy روی PUBLIC_PORT — تنها پورت عمومی Railway
     proxy_server = await asyncio.start_server(
         _smart_proxy_handler,
         "0.0.0.0",
         PUBLIC_PORT,
     )
-    logger.info(f"🔀 Smart proxy listening on 0.0.0.0:{PUBLIC_PORT}")
-    logger.info(f"   ├── plain HTTP → Admin API (:{ADMIN_PORT})")
-    logger.info(f"   └── TLS/binary → Xray (:{XRAY_INTERNAL_PORT})")
-
-    logger.info(f"🚀 RVG Gateway v11 — Xray-native + smart proxy")
-    logger.info(f"📡 Xray (VPN) internal port: {XRAY_INTERNAL_PORT}")
-    logger.info(f"📋 Protocols: {', '.join(PROTOCOLS_INFO)}")
+    logger.info(f"🔀 Smart proxy → 0.0.0.0:{PUBLIC_PORT} (Railway public port)")
+    logger.info(f"   ├── plain HTTP → Admin API :{ADMIN_PORT}")
+    logger.info(f"   └── TLS/binary → Xray      :{XRAY_INTERNAL_PORT}")
+    logger.info(f"🚀 RVG Gateway v12 — single-port Railway")
 
     try:
         await asyncio.Event().wait()
