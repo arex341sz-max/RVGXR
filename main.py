@@ -1,13 +1,11 @@
 """
-main.py — RVG Gateway v12 | Railway Single-Port
+main.py — RVG Gateway v13 | Single Port
 
-معماری:
-  PORT=8080  → Smart Proxy (عمومی — Railway expose می‌کنه)
-                 ├── plain HTTP → Admin API (127.0.0.1:10081)
-                 └── TLS/binary → Xray (127.0.0.1:10443)
+همه چیز روی PORT=8080:
+  /health, /, /login, /dashboard, /api/*, /sub/*, /p/*  → aiohttp مستقیم
+  /siz  → HTTP proxy به Xray داخلی (127.0.0.1:10443)
 
-  127.0.0.1:10081 → aiohttp Admin API + Dashboard (داخلی)
-  127.0.0.1:10443 → Xray VLESS+XHTTP+TLS (داخلی)
+هیچ پورت دیگه‌ای expose نمیشه.
 """
 import asyncio
 import base64
@@ -15,17 +13,17 @@ import hashlib
 import json
 import logging
 import os
-import ssl
 import secrets
 import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+import aiohttp
 from aiohttp import web
 
 from auth             import init_auth, is_valid_session, SESSION_COOKIE, SESSION_TTL
 from auth             import create_session, destroy_session, hash_password, require_auth_token
-from config           import ADMIN_PORT, PUBLIC_PORT, PUBLIC_DOMAIN, XRAY_INTERNAL_PORT
+from config           import PORT, PUBLIC_DOMAIN, XRAY_INTERNAL_PORT
 from config           import XRAY_CERT_FILE, XRAY_KEY_FILE
 from core.persistence import load_state, save_state
 from link_manager     import (
@@ -44,8 +42,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RVG")
 
+# session اتصال به Xray داخلی
+_xray_session: aiohttp.ClientSession | None = None
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _host() -> str:
     return os.environ.get("RAILWAY_PUBLIC_DOMAIN", PUBLIC_DOMAIN)
@@ -78,8 +77,10 @@ async def _check_auth(request: web.Request) -> str | None:
 async def _require_auth(request: web.Request) -> str:
     token = await _check_auth(request)
     if not token:
-        raise web.HTTPUnauthorized(text=json.dumps({"error": "unauthorized"}),
-                                   content_type="application/json")
+        raise web.HTTPUnauthorized(
+            text=json.dumps({"error": "unauthorized"}),
+            content_type="application/json",
+        )
     return token
 
 
@@ -93,6 +94,68 @@ def _build_stream_params(protocol: str, stream: str, body: dict, uid: str) -> di
     if stream == "grpc" and not sp.get("serviceName"):
         sp["serviceName"] = f"grpc-{uid[:8]}"
     return sp
+
+
+# ── VPN Proxy — /siz رو به Xray داخلی forward میکنه ─────────────────────────
+
+async def xray_proxy(request: web.Request) -> web.StreamResponse:
+    """
+    همه ترافیک /siz رو به Xray داخلی (127.0.0.1:10443) proxy میکنه.
+    از HTTP (بدون TLS) به Xray وصل میشه چون هر دو روی localhost هستن.
+    """
+    global _xray_session
+    if _xray_session is None or _xray_session.closed:
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
+        _xray_session = aiohttp.ClientSession(connector=connector)
+
+    xray_url = f"http://127.0.0.1:{XRAY_INTERNAL_PORT}/siz"
+
+    # forward همه query string
+    if request.query_string:
+        xray_url += f"?{request.query_string}"
+
+    # forward headers — بعضی header‌ها رو skip کن
+    skip_headers = {"host", "content-length", "transfer-encoding", "connection"}
+    forward_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in skip_headers
+    }
+    forward_headers["Host"] = f"127.0.0.1:{XRAY_INTERNAL_PORT}"
+
+    try:
+        # body رو streaming بخون
+        body = await request.read()
+
+        async with _xray_session.request(
+            method=request.method,
+            url=xray_url,
+            headers=forward_headers,
+            data=body if body else None,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=None, connect=10),
+        ) as xray_resp:
+            # response رو streaming برگردون
+            response = web.StreamResponse(
+                status=xray_resp.status,
+                headers={
+                    k: v for k, v in xray_resp.headers.items()
+                    if k.lower() not in {"transfer-encoding", "connection"}
+                },
+            )
+            await response.prepare(request)
+
+            async for chunk in xray_resp.content.iter_chunked(65536):
+                await response.write(chunk)
+
+            await response.write_eof()
+            return response
+
+    except aiohttp.ClientConnectorError:
+        logger.warning("Xray not ready yet")
+        return web.Response(status=503, text="VPN service starting...")
+    except Exception as e:
+        logger.debug(f"Xray proxy error: {e}")
+        return web.Response(status=502, text="Bad Gateway")
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -176,8 +239,8 @@ async def create_link(request: web.Request):
     if port == 0:
         port = 443
 
-    uid    = generate_uuid()
-    secret = generate_secret(protocol)
+    uid           = generate_uuid()
+    secret        = generate_secret(protocol)
     stream_params = _build_stream_params(protocol, stream, body, uid)
 
     entry = {
@@ -315,10 +378,10 @@ async def clone_link(request: web.Request):
     async with LINKS_LOCK:
         if uid not in LINKS:
             return err("کانفیگ پیدا نشد", 404)
-        original = LINKS[uid]
+        original   = LINKS[uid]
         new_uid    = generate_uuid()
         new_secret = generate_secret(original.get("protocol", "siz10a"))
-        new_link = {
+        new_link   = {
             **original,
             "uuid":          new_uid,
             "secret":        new_secret,
@@ -338,13 +401,13 @@ async def clone_link(request: web.Request):
 
     asyncio.create_task(reload_xray())
     asyncio.create_task(save_state())
-    host = _host()
+    host     = _host()
     link_url = generate_link_url(new_link, host)
     return json_resp({
         "uuid": new_uid, **new_link, "expired": False,
         "link_url": link_url,
-        "sub_url": f"https://{host}/sub/{new_uid}",
-        "message": "✅ کانفیگ کپی شد",
+        "sub_url":  f"https://{host}/sub/{new_uid}",
+        "message":  "✅ کانفیگ کپی شد",
     })
 
 
@@ -369,10 +432,12 @@ async def create_sub(request: web.Request):
         }
     asyncio.create_task(save_state())
     host = _host()
-    return json_resp({"sub_id": sub_id, **SUBS[sub_id], "password_hash": None,
-                      "has_password": bool(password),
-                      "public_url": f"https://{host}/p/{uuid_key}",
-                      "sub_url": f"https://{host}/sub-group/{uuid_key}"})
+    return json_resp({
+        "sub_id": sub_id, **SUBS[sub_id], "password_hash": None,
+        "has_password": bool(password),
+        "public_url": f"https://{host}/p/{uuid_key}",
+        "sub_url":    f"https://{host}/sub-group/{uuid_key}",
+    })
 
 
 async def list_subs(request: web.Request):
@@ -409,8 +474,8 @@ async def update_sub(request: web.Request):
         if sub_id not in SUBS:
             return err("sub not found", 404)
         s = SUBS[sub_id]
-        if "name" in body: s["name"] = str(body["name"])[:60]
-        if "desc" in body: s["desc"] = str(body["desc"])[:200]
+        if "name"     in body: s["name"] = str(body["name"])[:60]
+        if "desc"     in body: s["desc"] = str(body["desc"])[:200]
         if "password" in body:
             pw = str(body["password"]).strip()
             s["password_hash"] = hash_password(pw) if pw else None
@@ -503,7 +568,7 @@ async def get_stats(request: web.Request):
     for d in snap.values():
         if is_allowed(d):
             proto_counts[d.get("protocol", "siz10a")] += 1
-    s = int(time.time() - stats["start_time"])
+    s      = int(time.time() - stats["start_time"])
     uptime = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
     return json_resp({
         "active_connections": len(connections),
@@ -524,7 +589,7 @@ async def get_stats(request: web.Request):
 
 
 async def health(request: web.Request):
-    s = int(time.time() - stats["start_time"])
+    s      = int(time.time() - stats["start_time"])
     uptime = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
     return json_resp({
         "status":      "ok",
@@ -564,9 +629,9 @@ async def sub_single(request: web.Request):
     return web.Response(
         text=content, content_type="text/plain",
         headers={
-            "profile-title": quote(link["label"]),
-            "support-url":   "https://t.me/CodeBoxo",
-            "profile-update-interval": "12",
+            "profile-title":            quote(link["label"]),
+            "support-url":              "https://t.me/CodeBoxo",
+            "profile-update-interval":  "12",
         },
     )
 
@@ -601,8 +666,8 @@ async def sub_group(request: web.Request):
     return web.Response(
         text=content, content_type="text/plain",
         headers={
-            "profile-title": quote(sub["name"]),
-            "support-url":   "https://t.me/CodeBoxo",
+            "profile-title":           quote(sub["name"]),
+            "support-url":             "https://t.me/CodeBoxo",
             "profile-update-interval": "12",
         },
     )
@@ -665,10 +730,10 @@ async def public_sub_data(request: web.Request):
 async def root(request: web.Request):
     return json_resp({
         "service":   "RVG Gateway",
-        "version":   "12.0",
+        "version":   "13.0",
         "status":    "active",
-        "arch":      "Xray-native (single-port Railway)",
-        "xray_port": XRAY_INTERNAL_PORT,
+        "arch":      "single-port (aiohttp + xray-proxy)",
+        "port":      PORT,
         "protocols": list(PROTOCOLS_INFO),
         "channel":   "https://t.me/CodeBoxo",
     })
@@ -696,40 +761,62 @@ async def public_page(request: web.Request):
 
 # ── App builder ───────────────────────────────────────────────────────────────
 
-def build_admin_app() -> web.Application:
-    app = web.Application()
+def build_app() -> web.Application:
+    app = web.Application(client_max_size=200 * 1024 * 1024)  # 200MB برای VPN traffic
+
+    # ── VPN proxy — باید اول باشه ─────────────────────────────────────────────
+    app.router.add_route("*", "/siz",    xray_proxy)
+    app.router.add_route("*", "/siz/",   xray_proxy)
+    app.router.add_route("*", "/siz/{tail:.*}", xray_proxy)
+
+    # ── Pages ──────────────────────────────────────────────────────────────────
     app.router.add_get("/",                           root)
     app.router.add_get("/login",                      login_page)
     app.router.add_get("/dashboard",                  dashboard_page)
     app.router.add_get("/p/{uuid_key}",               public_page)
+
+    # ── Auth API ───────────────────────────────────────────────────────────────
     app.router.add_post("/api/login",                 login)
     app.router.add_post("/api/logout",                logout)
     app.router.add_get("/api/me",                     me)
     app.router.add_post("/api/change-password",       change_password)
+
+    # ── Links API ──────────────────────────────────────────────────────────────
     app.router.add_post("/api/links",                 create_link)
     app.router.add_get("/api/links",                  list_links)
     app.router.add_patch("/api/links/{uid}",          update_link)
     app.router.add_delete("/api/links/{uid}",         delete_link)
     app.router.add_post("/api/links/{uid}/clone",     clone_link)
+
+    # ── Subs API ───────────────────────────────────────────────────────────────
     app.router.add_post("/api/subs",                  create_sub)
     app.router.add_get("/api/subs",                   list_subs)
     app.router.add_patch("/api/subs/{sub_id}",        update_sub)
     app.router.add_delete("/api/subs/{sub_id}",       delete_sub)
     app.router.add_post("/api/subs/{sub_id}/links",   assign_link_to_sub)
+
+    # ── Xray API ───────────────────────────────────────────────────────────────
     app.router.add_get("/api/xray/status",            xray_status)
     app.router.add_post("/api/xray/restart",          xray_restart)
     app.router.add_post("/api/xray/reload",           xray_reload)
     app.router.add_post("/api/xray/start",            xray_start_ep)
     app.router.add_post("/api/xray/stop",             xray_stop_ep)
     app.router.add_get("/api/xray/ports",             xray_ports_ep)
+
+    # ── Stats / Health ─────────────────────────────────────────────────────────
     app.router.add_get("/stats",                      get_stats)
     app.router.add_get("/health",                     health)
+
+    # ── Protocols ──────────────────────────────────────────────────────────────
     app.router.add_get("/api/protocols",              api_protocols)
     app.router.add_get("/api/protocols/{name}/modes", api_protocol_modes)
+
+    # ── Subscriptions ──────────────────────────────────────────────────────────
     app.router.add_get("/sub/{uuid}",                 sub_single)
     app.router.add_get("/sub-all",                    sub_all)
     app.router.add_get("/sub-group/{uuid_key}",       sub_group)
     app.router.add_get("/api/public/sub/{uuid_key}",  public_sub_data)
+
     return app
 
 
@@ -776,7 +863,7 @@ def _ensure_self_signed_cert() -> bool:
     import subprocess
     from config import XRAY_CERT_DIR, XRAY_CERT_FILE, XRAY_KEY_FILE
     if os.path.exists(XRAY_CERT_FILE) and os.path.exists(XRAY_KEY_FILE):
-        logger.info(f"🔐 Cert already exists → {XRAY_CERT_DIR}/")
+        logger.info(f"🔐 Cert exists → {XRAY_CERT_DIR}/")
         return True
     os.makedirs(XRAY_CERT_DIR, exist_ok=True)
     try:
@@ -789,109 +876,8 @@ def _ensure_self_signed_cert() -> bool:
         logger.info(f"🔐 Self-signed cert generated → {XRAY_CERT_DIR}/")
         return True
     except Exception as e:
-        logger.error(f"❌ Cert generation error: {e}")
+        logger.error(f"❌ Cert error: {e}")
         return False
-
-
-# ── Smart Proxy ───────────────────────────────────────────────────────────────
-#
-# روی PORT عمومی Railway گوش میده:
-#   - plain HTTP → Admin API (127.0.0.1:ADMIN_PORT)
-#   - TLS/binary → Xray   (127.0.0.1:XRAY_INTERNAL_PORT)
-
-ADMIN_PROXY_HOST = "127.0.0.1"
-XRAY_PROXY_HOST  = "127.0.0.1"
-
-
-def _is_plain_http(data: bytes) -> bool:
-    """بررسی اینکه آیا داده plain HTTP هست یا TLS/binary"""
-    # TLS ClientHello با byte 0x16 0x03 شروع میشه
-    if len(data) >= 3 and data[0] == 0x16 and data[1] == 0x03:
-        return False
-    # HTTP methods
-    for prefix in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ",
-                   b"HEAD ", b"OPTIONS ", b"CONNECT "):
-        if data.startswith(prefix):
-            return True
-    return False
-
-
-async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        while True:
-            chunk = await reader.read(65536)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-async def _smart_proxy_handler(
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
-    try:
-        # خوندن اول داده برای تشخیص نوع ترافیک
-        try:
-            first_bytes = await asyncio.wait_for(client_reader.read(4096), timeout=15.0)
-        except asyncio.TimeoutError:
-            client_writer.close()
-            return
-
-        if not first_bytes:
-            client_writer.close()
-            return
-
-        if _is_plain_http(first_bytes):
-            # → Admin API
-            target_host = ADMIN_PROXY_HOST
-            target_port = ADMIN_PORT
-        else:
-            # → Xray TLS
-            target_host = XRAY_PROXY_HOST
-            target_port = XRAY_INTERNAL_PORT
-
-        # اتصال به target — retry اگه هنوز آماده نیست
-        up_reader = up_writer = None
-        for attempt in range(5):
-            try:
-                up_reader, up_writer = await asyncio.wait_for(
-                    asyncio.open_connection(target_host, target_port),
-                    timeout=5.0,
-                )
-                break
-            except Exception:
-                if attempt < 4:
-                    await asyncio.sleep(0.5)
-                else:
-                    client_writer.close()
-                    return
-
-        # ارسال داده‌های اولیه
-        up_writer.write(first_bytes)
-        await up_writer.drain()
-
-        # pipe دو طرفه
-        await asyncio.gather(
-            _pipe(client_reader, up_writer),
-            _pipe(up_reader, client_writer),
-            return_exceptions=True,
-        )
-
-    except Exception as e:
-        logger.debug(f"Proxy handler error: {e}")
-    finally:
-        try:
-            client_writer.close()
-        except Exception:
-            pass
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -902,34 +888,29 @@ async def main():
     await _ensure_default_link()
     _ensure_self_signed_cert()
 
-    # 1. Admin API روی ADMIN_PORT (داخلی — فقط localhost)
-    app = build_admin_app()
+    # Xray داخلی start کن
+    await start_monitor()
+    logger.info(f"📡 Xray internal → 127.0.0.1:{XRAY_INTERNAL_PORT}")
+
+    # همه چیز روی یک پورت
+    app    = build_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    admin_site = web.TCPSite(runner, "127.0.0.1", ADMIN_PORT)
-    await admin_site.start()
-    logger.info(f"🖥  Admin API → 127.0.0.1:{ADMIN_PORT}")
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-    # 2. Xray start (داخلی)
-    await start_monitor()
-    logger.info(f"📡 Xray → 127.0.0.1:{XRAY_INTERNAL_PORT}")
-
-    # 3. Smart Proxy روی PUBLIC_PORT — تنها پورت عمومی Railway
-    proxy_server = await asyncio.start_server(
-        _smart_proxy_handler,
-        "0.0.0.0",
-        PUBLIC_PORT,
-    )
-    logger.info(f"🔀 Smart proxy → 0.0.0.0:{PUBLIC_PORT} (Railway public port)")
-    logger.info(f"   ├── plain HTTP → Admin API :{ADMIN_PORT}")
-    logger.info(f"   └── TLS/binary → Xray      :{XRAY_INTERNAL_PORT}")
-    logger.info(f"🚀 RVG Gateway v12 — single-port Railway")
+    logger.info(f"🚀 RVG Gateway v13 → 0.0.0.0:{PORT} (single port)")
+    logger.info(f"   ├── /siz        → Xray proxy (VPN)")
+    logger.info(f"   ├── /dashboard  → Admin panel")
+    logger.info(f"   ├── /health     → Health check")
+    logger.info(f"   └── /api/*      → REST API")
 
     try:
         await asyncio.Event().wait()
     finally:
-        proxy_server.close()
-        await proxy_server.wait_closed()
+        global _xray_session
+        if _xray_session and not _xray_session.closed:
+            await _xray_session.close()
         await stop_monitor()
         await save_state()
         await runner.cleanup()
