@@ -1,4 +1,4 @@
-"""xray_config.py — تولید Xray config با یه inbound واحد برای همه لینک‌ها (FIXED)"""
+"""xray_config.py — تولید Xray config با یه inbound واحد برای همه لینک‌ها"""
 import json
 import logging
 from datetime import datetime
@@ -27,37 +27,21 @@ def _is_allowed(link: dict) -> bool:
 
 
 async def build_xray_config() -> dict:
-    """
-    یه Xray config با یه inbound واحد VLESS+XHTTP روی پورت public می‌سازه.
-    همه کلاینت‌ها (UUID های مختلف) توی همین یه inbound هستن.
-    
-    ✅ FIX: Fallback کنفیگ شد
-    - HTTP requests به /siz path → Xray میرونه
-    - سایر HTTP requests → block میشوند
-    - TLS handshake errors حل شدند
-    """
     async with LINKS_LOCK:
         snapshot = {k: dict(v) for k, v in LINKS.items()}
 
-    # جمع‌آوری همه UUID های فعال
     clients = []
     for uuid, link in snapshot.items():
         if not _is_allowed(link):
             continue
-        client = {
-            "id":   link.get("secret", uuid),
-            "flow": "",
-        }
-        clients.append(client)
+        clients.append({"id": link.get("secret", uuid), "flow": ""})
         logger.debug(f"  client: {uuid[:8]} label={link.get('label','')}")
 
     if not clients:
-        # یه placeholder اگه هیچ لینکی نیست
         clients = [{"id": "00000000-0000-0000-0000-000000000000", "flow": ""}]
 
     logger.info(f"📋 Xray config: {len(clients)} client(s) in single inbound")
 
-    # ✅ FIX: inbound VLESS + XHTTP + TLS با fallback درست
     inbound = {
         "tag":      "siz10a-main",
         "listen":   "0.0.0.0",
@@ -66,17 +50,10 @@ async def build_xray_config() -> dict:
         "settings": {
             "clients":    clients,
             "decryption": "none",
-            # ✅ FIX: fallback منطقی برای non-XHTTP requests
-            "fallbacks":  [
-                # HTTP request to /siz → Xray handles it via xhttp
-                {
-                    "path": "/siz",
-                    "dest": "127.0.0.1:443",  # Loopback for xhttp tunnel
-                },
-                # Default: block non-matching HTTP
-                {
-                    "dest": "127.0.0.1:22"  # SSH-like response to break TLS handshake
-                }
+            "fallbacks": [
+                # FIX: plain HTTP (health check Railway) → forward به port 8082
+                # قبلاً dest: 80 بود که در Railway وجود نداره → حالا 8082
+                {"dest": 8082, "xver": 0},
             ],
         },
         "streamSettings": {
@@ -84,7 +61,6 @@ async def build_xray_config() -> dict:
             "security": "tls",
             "tlsSettings": {
                 "minVersion":   "1.2",
-                "maxVersion":   "1.3",
                 "certificates": [{
                     "certificateFile": XRAY_CERT_FILE,
                     "keyFile":         XRAY_KEY_FILE,
@@ -140,5 +116,4 @@ async def write_xray_config() -> str:
 
 
 def get_port_map() -> dict:
-    """برای compatibility با API قدیمی — دیگه port map نداریم"""
     return {}
