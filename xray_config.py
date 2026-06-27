@@ -1,10 +1,10 @@
-"""xray_config.py — تولید Xray config با یه inbound واحد برای همه لینک‌ها"""
+"""xray_config.py — تولید Xray config — Xray روی پورت داخلی 9443"""
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 
-from config import XRAY_MAIN_CFG, XRAY_CERT_FILE, XRAY_KEY_FILE, PUBLIC_PORT
+from config import XRAY_MAIN_CFG, XRAY_CERT_FILE, XRAY_KEY_FILE, XRAY_INTERNAL_PORT
 from state  import LINKS, LINKS_LOCK
 
 logger = logging.getLogger("RVG.xray_config")
@@ -27,6 +27,10 @@ def _is_allowed(link: dict) -> bool:
 
 
 async def build_xray_config() -> dict:
+    """
+    Xray روی پورت داخلی XRAY_INTERNAL_PORT (9443) گوش میده.
+    Python proxy روی PORT (8080) همه ترافیک VPN رو به اینجا forward میکنه.
+    """
     async with LINKS_LOCK:
         snapshot = {k: dict(v) for k, v in LINKS.items()}
 
@@ -40,21 +44,16 @@ async def build_xray_config() -> dict:
     if not clients:
         clients = [{"id": "00000000-0000-0000-0000-000000000000", "flow": ""}]
 
-    logger.info(f"📋 Xray config: {len(clients)} client(s) in single inbound")
+    logger.info(f"📋 Xray config: {len(clients)} client(s) — internal port {XRAY_INTERNAL_PORT}")
 
     inbound = {
         "tag":      "siz10a-main",
-        "listen":   "0.0.0.0",
-        "port":     PUBLIC_PORT,
+        "listen":   "127.0.0.1",        # فقط localhost — Python proxy از اینجا forward میکنه
+        "port":     XRAY_INTERNAL_PORT,
         "protocol": "vless",
         "settings": {
             "clients":    clients,
             "decryption": "none",
-            "fallbacks": [
-                # FIX: plain HTTP (health check Railway) → forward به port 8082
-                # قبلاً dest: 80 بود که در Railway وجود نداره → حالا 8082
-                {"dest": 8082, "xver": 0},
-            ],
         },
         "streamSettings": {
             "network":  "xhttp",
@@ -108,7 +107,7 @@ async def write_xray_config() -> str:
     path     = Path(XRAY_MAIN_CFG)
     path.parent.mkdir(parents=True, exist_ok=True)
     json_str = json.dumps(config, ensure_ascii=False, indent=2)
-    json.loads(json_str)  # validate
+    json.loads(json_str)
     with open(path, "w", encoding="utf-8") as f:
         f.write(json_str)
     logger.info(f"✅ Xray config written → {path}")
