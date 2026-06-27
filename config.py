@@ -1,0 +1,23 @@
+"""config.py — تمام تنظیمات از environment variables"""
+import os
+import secrets
+
+PORT          = int(os.environ.get("PORT", 8080))
+PUBLIC_PORT   = PORT  # Xray مستقیم روی همین پورت گوش میده
+SECRET_KEY    = os.environ.get("SECRET_KEY", secrets.token_urlsafe(32))
+ADMIN_PW      = os.environ.get("ADMIN_PASSWORD", "123456")
+PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")
+
+DATA_DIR        = os.environ.get("DATA_DIR", "/data")
+XRAY_CONFIG_DIR = os.environ.get("XRAY_CONFIG_DIR", "/data/xray-configs")
+XRAY_BIN        = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+XRAY_MAIN_CFG   = os.environ.get("XRAY_MAIN_CFG", "/data/xray-main.json")
+
+XRAY_CERT_DIR  = os.environ.get("XRAY_CERT_DIR", "/data/certs")
+XRAY_CERT_FILE = os.path.join(XRAY_CERT_DIR, "cert.pem")
+XRAY_KEY_FILE  = os.path.join(XRAY_CERT_DIR, "key.pem")
+
+# پورت داخلی برای API/Dashboard (FastAPI حذف شده — اکنون aiohttp سبک)
+ADMIN_PORT = int(os.environ.get("ADMIN_PORT", 8081))
+
+SESSION_TTL = 60 * 60 * 24 * 7
