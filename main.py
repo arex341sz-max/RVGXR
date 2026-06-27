@@ -1,15 +1,13 @@
 """
-main.py — RVG Gateway v11 | Xray-native (بدون FastAPI)
+main.py — RVG Gateway v11 | Xray-native
 
-معماری:
-  - Xray مستقیماً روی پورت PUBLIC (8080) → همه ترافیک VPN
-  - aiohttp سبک روی ADMIN_PORT (8081) → dashboard + API
-  - HTTP fallback listener روی port 8082 → health check های Railway
-  - هیچ relay/proxy لازم نیست — Xray native handle می‌کنه
-
-FIX: اضافه شدن HTTP health-check server روی port 8082
-     تا Railway health check (plain HTTP) جواب درست بگیره
-     به جای TLS handshake error.
+معماری نهایی:
+  PORT=8080  → Python smart proxy (عمومی — Railway)
+                 ├── GET /health, /         → جواب مستقیم (200 OK)
+                 ├── /login, /dashboard, /api/*, /sub/*, /p/* → aiohttp (8081)
+                 └── بقیه (VPN traffic /siz) → Xray TLS (9443)
+  PORT=8081  → aiohttp Admin API + Dashboard (داخلی)
+  PORT=9443  → Xray VLESS+XHTTP+TLS (داخلی، فقط localhost)
 """
 import asyncio
 import base64
@@ -17,16 +15,18 @@ import hashlib
 import json
 import logging
 import os
+import ssl
 import secrets
 import time
 from datetime import datetime, timedelta
-from urllib.parse import quote, parse_qs, urlparse
+from urllib.parse import quote
 
 from aiohttp import web
 
 from auth             import init_auth, is_valid_session, SESSION_COOKIE, SESSION_TTL
 from auth             import create_session, destroy_session, hash_password, require_auth_token
-from config           import ADMIN_PORT, PUBLIC_PORT, PUBLIC_DOMAIN
+from config           import ADMIN_PORT, PUBLIC_PORT, PUBLIC_DOMAIN, XRAY_INTERNAL_PORT
+from config           import XRAY_CERT_FILE, XRAY_KEY_FILE
 from core.persistence import load_state, save_state
 from link_manager     import (
     generate_uuid, generate_secret, protocol_defaults,
@@ -43,10 +43,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("RVG")
-
-# ── FIX: پورت HTTP fallback برای health check Railway ────────────────────────
-# Xray plain HTTP requests رو به این پورت forward میکنه (از fallback config)
-HEALTH_FALLBACK_PORT = int(os.environ.get("HEALTH_FALLBACK_PORT", 8082))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -68,11 +64,9 @@ def err(msg, status=400):
 
 
 async def _check_auth(request: web.Request) -> str | None:
-    """Returns session token if valid, else None"""
     token = request.cookies.get(SESSION_COOKIE)
     if token and await is_valid_session(token):
         return token
-    # also check Authorization header for API clients
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
@@ -89,18 +83,8 @@ async def _require_auth(request: web.Request) -> str:
     return token
 
 
-def _check_port_conflict(new_port: int, exclude_uuid: str = None) -> bool:
-    for uid, link in LINKS.items():
-        if exclude_uuid and uid == exclude_uuid:
-            continue
-        if link.get("port") == new_port:
-            return True
-    return False
-
-
 def _build_stream_params(protocol: str, stream: str, body: dict, uid: str) -> dict:
     sp = body.get("stream_params", {}) or {}
-    # برای siz10a همیشه path /siz هست (یه inbound مشترک)
     if protocol == "siz10a" or stream == "xhttp":
         sp["path"] = "/siz"
     elif stream in ("ws", "httpupgrade") and not sp.get("path"):
@@ -200,7 +184,7 @@ async def create_link(request: web.Request):
         "uuid":                uid,
         "secret":              secret,
         "protocol":            protocol,
-        "stream":              "xhttp",   # همیشه xhttp برای Xray-native
+        "stream":              "xhttp",
         "tls":                 tls,
         "stream_params":       stream_params,
         "port":                port,
@@ -336,12 +320,12 @@ async def clone_link(request: web.Request):
         new_secret = generate_secret(original.get("protocol", "siz10a"))
         new_link = {
             **original,
-            "uuid":         new_uid,
-            "secret":       new_secret,
-            "label":        f"{original.get('label', 'لینک')} (کپی)",
-            "created_at":   datetime.now().isoformat(),
-            "used_bytes":   0,
-            "is_default":   False,
+            "uuid":          new_uid,
+            "secret":        new_secret,
+            "label":         f"{original.get('label', 'لینک')} (کپی)",
+            "created_at":    datetime.now().isoformat(),
+            "used_bytes":    0,
+            "is_default":    False,
             "stream_params": {"path": "/siz"},
         }
         LINKS[new_uid] = new_link
@@ -508,7 +492,7 @@ async def xray_ports_ep(request: web.Request):
     return json_resp({"port_map": get_port_map()})
 
 
-# ── Stats routes ──────────────────────────────────────────────────────────────
+# ── Stats / Health ────────────────────────────────────────────────────────────
 
 async def get_stats(request: web.Request):
     await _require_auth(request)
@@ -550,7 +534,7 @@ async def health(request: web.Request):
     })
 
 
-# ── Protocols routes ──────────────────────────────────────────────────────────
+# ── Protocols ─────────────────────────────────────────────────────────────────
 
 async def api_protocols(request: web.Request):
     return json_resp({"protocols": list_protocols()})
@@ -565,7 +549,7 @@ async def api_protocol_modes(request: web.Request):
         return err("پروتکل پیدا نشد", 404)
 
 
-# ── Subscription routes ───────────────────────────────────────────────────────
+# ── Subscriptions ─────────────────────────────────────────────────────────────
 
 async def sub_single(request: web.Request):
     uuid = request.match_info["uuid"]
@@ -642,7 +626,7 @@ async def public_sub_data(request: web.Request):
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
         snap = dict(LINKS)
-    links_out   = []
+    links_out    = []
     active_conns = 0
     for lid in link_ids:
         link = snap.get(lid)
@@ -676,17 +660,17 @@ async def public_sub_data(request: web.Request):
     })
 
 
-# ── Pages (HTML) ──────────────────────────────────────────────────────────────
+# ── Pages ─────────────────────────────────────────────────────────────────────
 
 async def root(request: web.Request):
     return json_resp({
-        "service":  "RVG Gateway",
-        "version":  "11.0",
-        "status":   "active",
-        "arch":     "Xray-native (no relay)",
-        "xray_port": PUBLIC_PORT,
+        "service":   "RVG Gateway",
+        "version":   "11.0",
+        "status":    "active",
+        "arch":      "Xray-native (smart proxy)",
+        "xray_port": XRAY_INTERNAL_PORT,
         "protocols": list(PROTOCOLS_INFO),
-        "channel":  "https://t.me/CodeBoxo",
+        "channel":   "https://t.me/CodeBoxo",
     })
 
 
@@ -710,7 +694,46 @@ async def public_page(request: web.Request):
     return web.Response(text=get_html(uuid_key), content_type="text/html")
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── App builder (Admin API روی 8081) ─────────────────────────────────────────
+
+def build_admin_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/",                           root)
+    app.router.add_get("/login",                      login_page)
+    app.router.add_get("/dashboard",                  dashboard_page)
+    app.router.add_get("/p/{uuid_key}",               public_page)
+    app.router.add_post("/api/login",                 login)
+    app.router.add_post("/api/logout",                logout)
+    app.router.add_get("/api/me",                     me)
+    app.router.add_post("/api/change-password",       change_password)
+    app.router.add_post("/api/links",                 create_link)
+    app.router.add_get("/api/links",                  list_links)
+    app.router.add_patch("/api/links/{uid}",          update_link)
+    app.router.add_delete("/api/links/{uid}",         delete_link)
+    app.router.add_post("/api/links/{uid}/clone",     clone_link)
+    app.router.add_post("/api/subs",                  create_sub)
+    app.router.add_get("/api/subs",                   list_subs)
+    app.router.add_patch("/api/subs/{sub_id}",        update_sub)
+    app.router.add_delete("/api/subs/{sub_id}",       delete_sub)
+    app.router.add_post("/api/subs/{sub_id}/links",   assign_link_to_sub)
+    app.router.add_get("/api/xray/status",            xray_status)
+    app.router.add_post("/api/xray/restart",          xray_restart)
+    app.router.add_post("/api/xray/reload",           xray_reload)
+    app.router.add_post("/api/xray/start",            xray_start_ep)
+    app.router.add_post("/api/xray/stop",             xray_stop_ep)
+    app.router.add_get("/api/xray/ports",             xray_ports_ep)
+    app.router.add_get("/stats",                      get_stats)
+    app.router.add_get("/health",                     health)
+    app.router.add_get("/api/protocols",              api_protocols)
+    app.router.add_get("/api/protocols/{name}/modes", api_protocol_modes)
+    app.router.add_get("/sub/{uuid}",                 sub_single)
+    app.router.add_get("/sub-all",                    sub_all)
+    app.router.add_get("/sub-group/{uuid_key}",       sub_group)
+    app.router.add_get("/api/public/sub/{uuid_key}",  public_sub_data)
+    return app
+
+
+# ── Startup helpers ───────────────────────────────────────────────────────────
 
 async def _ensure_default_link():
     from config import SECRET_KEY
@@ -770,102 +793,120 @@ def _ensure_self_signed_cert() -> bool:
         return False
 
 
-# ── App builder ───────────────────────────────────────────────────────────────
+# ── Smart Proxy روی PORT=8080 ─────────────────────────────────────────────────
+#
+# این proxy روی پورت عمومی Railway گوش میده و ترافیک رو تشخیص میده:
+#   - plain HTTP (GET /health, /login, /api/*, ...) → forward به aiohttp (8081)
+#   - TLS / binary (VPN clients) → forward به Xray (9443)
+#
+# Railway health check با plain HTTP میاد → به 8081 هدایت میشه → 200 OK ✅
+# کلاینت‌های VPN با TLS میان → به 9443 (Xray) هدایت میشن ✅
 
-def build_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/",                         root)
-    app.router.add_get("/login",                    login_page)
-    app.router.add_get("/dashboard",                dashboard_page)
-    app.router.add_get("/p/{uuid_key}",             public_page)
+ADMIN_PROXY_HOST = "127.0.0.1"
+XRAY_PROXY_HOST  = "127.0.0.1"
 
-    # Auth
-    app.router.add_post("/api/login",               login)
-    app.router.add_post("/api/logout",              logout)
-    app.router.add_get("/api/me",                   me)
-    app.router.add_post("/api/change-password",     change_password)
-
-    # Links
-    app.router.add_post("/api/links",               create_link)
-    app.router.add_get("/api/links",                list_links)
-    app.router.add_patch("/api/links/{uid}",        update_link)
-    app.router.add_delete("/api/links/{uid}",       delete_link)
-    app.router.add_post("/api/links/{uid}/clone",   clone_link)
-
-    # Subs
-    app.router.add_post("/api/subs",                create_sub)
-    app.router.add_get("/api/subs",                 list_subs)
-    app.router.add_patch("/api/subs/{sub_id}",      update_sub)
-    app.router.add_delete("/api/subs/{sub_id}",     delete_sub)
-    app.router.add_post("/api/subs/{sub_id}/links", assign_link_to_sub)
-
-    # Xray
-    app.router.add_get("/api/xray/status",          xray_status)
-    app.router.add_post("/api/xray/restart",        xray_restart)
-    app.router.add_post("/api/xray/reload",         xray_reload)
-    app.router.add_post("/api/xray/start",          xray_start_ep)
-    app.router.add_post("/api/xray/stop",           xray_stop_ep)
-    app.router.add_get("/api/xray/ports",           xray_ports_ep)
-
-    # Stats
-    app.router.add_get("/stats",                    get_stats)
-    app.router.add_get("/health",                   health)
-
-    # Protocols
-    app.router.add_get("/api/protocols",            api_protocols)
-    app.router.add_get("/api/protocols/{name}/modes", api_protocol_modes)
-
-    # Subscriptions
-    app.router.add_get("/sub/{uuid}",               sub_single)
-    app.router.add_get("/sub-all",                  sub_all)
-    app.router.add_get("/sub-group/{uuid_key}",     sub_group)
-    app.router.add_get("/api/public/sub/{uuid_key}", public_sub_data)
-
-    return app
+# مسیرهایی که باید به Admin API بره (plain HTTP)
+_ADMIN_PREFIXES = (
+    b"GET /health",
+    b"GET /",
+    b"GET /login",
+    b"GET /dashboard",
+    b"GET /stats",
+    b"GET /sub",
+    b"GET /api/",
+    b"GET /p/",
+    b"POST /api/",
+    b"PATCH /api/",
+    b"DELETE /api/",
+    b"HEAD /",
+    b"OPTIONS /",
+)
 
 
-# ── FIX: HTTP Health-check server (fallback از Xray) ─────────────────────────
-# Railway health check با plain HTTP به port 8080 وصل میشه
-# Xray این درخواست‌ها رو به port 8082 forward میکنه (از طریق fallback config)
-# این server روی 8082 گوش میده و /health رو جواب میده
+def _is_plain_http(data: bytes) -> bool:
+    """بررسی اینکه آیا داده plain HTTP هست یا TLS/binary"""
+    # TLS ClientHello با byte 0x16 0x03 شروع میشه
+    if len(data) >= 3 and data[0] == 0x16 and data[1] == 0x03:
+        return False
+    # HTTP methods
+    for prefix in (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"PATCH ",
+                   b"HEAD ", b"OPTIONS ", b"CONNECT "):
+        if data.startswith(prefix):
+            return True
+    return False
 
-async def _http_health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """
-    یه HTTP handler ساده برای health check های Railway.
-    Xray plain HTTP requests رو از port 8080 به اینجا forward میکنه.
-    """
+
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        # خوندن request header
-        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
-        request_line = data.decode("utf-8", errors="replace").split("\r\n")[0]
-
-        s = int(time.time() - stats["start_time"])
-        uptime = f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
-        body = json.dumps({
-            "status":      "ok",
-            "connections": len(connections),
-            "uptime":      uptime,
-            "xray":        get_status()["running"],
-        })
-        response = (
-            f"HTTP/1.1 200 OK\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-            f"{body}"
-        )
-        writer.write(response.encode())
-        await writer.drain()
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
     except Exception:
         pass
     finally:
         try:
             writer.close()
-            await writer.wait_closed()
         except Exception:
             pass
 
+
+async def _smart_proxy_handler(
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+):
+    peer = client_writer.get_extra_info("peername", ("?", 0))
+    try:
+        # خوندن اول داده برای تشخیص نوع ترافیک
+        try:
+            first_bytes = await asyncio.wait_for(client_reader.read(4096), timeout=10.0)
+        except asyncio.TimeoutError:
+            client_writer.close()
+            return
+
+        if not first_bytes:
+            client_writer.close()
+            return
+
+        if _is_plain_http(first_bytes):
+            # → Admin API (aiohttp روی 8081)
+            target_host = ADMIN_PROXY_HOST
+            target_port = ADMIN_PORT
+        else:
+            # → Xray TLS (روی 9443)
+            target_host = XRAY_PROXY_HOST
+            target_port = XRAY_INTERNAL_PORT
+
+        try:
+            up_reader, up_writer = await asyncio.open_connection(target_host, target_port)
+        except Exception as e:
+            logger.warning(f"Proxy connect failed → {target_host}:{target_port}: {e}")
+            client_writer.close()
+            return
+
+        # ارسال داده‌های اولیه که خوندیم
+        up_writer.write(first_bytes)
+        await up_writer.drain()
+
+        # pipe دو طرفه
+        await asyncio.gather(
+            _pipe(client_reader, up_writer),
+            _pipe(up_reader, client_writer),
+            return_exceptions=True,
+        )
+
+    except Exception as e:
+        logger.debug(f"Proxy handler error from {peer}: {e}")
+    finally:
+        try:
+            client_writer.close()
+        except Exception:
+            pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
     init_auth()
@@ -874,32 +915,33 @@ async def main():
     _ensure_self_signed_cert()
     await start_monitor()
 
-    # Admin API (aiohttp) روی پورت 8081
-    app = build_app()
+    # 1. Admin API روی 8081 (داخلی)
+    app = build_admin_app()
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", ADMIN_PORT)
-    await site.start()
+    admin_site = web.TCPSite(runner, "127.0.0.1", ADMIN_PORT)
+    await admin_site.start()
+    logger.info(f"🖥  Admin API listening on 127.0.0.1:{ADMIN_PORT}")
 
-    # FIX: HTTP health-check server روی پورت 8082
-    # این server plain HTTP requests از Xray fallback رو handle میکنه
-    health_server = await asyncio.start_server(
-        _http_health_handler,
-        "127.0.0.1",   # فقط localhost — Xray از همین host forward میکنه
-        HEALTH_FALLBACK_PORT,
+    # 2. Smart Proxy روی PUBLIC_PORT (8080) — عمومی
+    proxy_server = await asyncio.start_server(
+        _smart_proxy_handler,
+        "0.0.0.0",
+        PUBLIC_PORT,
     )
-    logger.info(f"🏥 HTTP health-check server listening on 127.0.0.1:{HEALTH_FALLBACK_PORT}")
+    logger.info(f"🔀 Smart proxy listening on 0.0.0.0:{PUBLIC_PORT}")
+    logger.info(f"   ├── plain HTTP → Admin API (:{ADMIN_PORT})")
+    logger.info(f"   └── TLS/binary → Xray (:{XRAY_INTERNAL_PORT})")
 
-    logger.info(f"🚀 RVG Gateway v11 — Xray-native architecture")
-    logger.info(f"📡 Xray (VPN) listening on port {PUBLIC_PORT}")
-    logger.info(f"🖥  Admin API listening on port {ADMIN_PORT}")
+    logger.info(f"🚀 RVG Gateway v11 — Xray-native + smart proxy")
+    logger.info(f"📡 Xray (VPN) internal port: {XRAY_INTERNAL_PORT}")
     logger.info(f"📋 Protocols: {', '.join(PROTOCOLS_INFO)}")
 
     try:
         await asyncio.Event().wait()
     finally:
-        health_server.close()
-        await health_server.wait_closed()
+        proxy_server.close()
+        await proxy_server.wait_closed()
         await stop_monitor()
         await save_state()
         await runner.cleanup()
